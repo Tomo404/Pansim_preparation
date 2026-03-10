@@ -86,12 +86,24 @@ def main() -> None:
 
     os.makedirs(args.outdir, exist_ok=True)
 
-    gen = pd.read_csv(args.generated)
+    gen = pd.read_csv(
+        args.generated,
+        dtype={
+            "settlement": "string",
+            "teaor": "string",
+            "bin": "string",
+        }
+    )
+
     gen["teaor"] = gen["teaor"].astype(str)
     gen["teaor"] = gen["teaor"].str.replace(r"\.0$", "", regex=True).str.lstrip("0")
     gen.loc[gen["teaor"] == "", "teaor"] = "0"
+
     gen["settlement"] = gen["settlement"].astype(str)
-    gen["bin"] = gen["bin"].astype(str)
+    gen["settlement"] = gen["settlement"].str.replace(r"\.0$", "", regex=True).str.strip()
+
+    gen["bin"] = gen["bin"].astype(str).apply(normalize_bin)
+
     gen["company_size"] = gen["company_size"].astype(int)
 
     # -----------------------------
@@ -122,17 +134,20 @@ def main() -> None:
     # (2) Territorial/company-count consistency
     # -----------------------------
     from data_loader import load_counts_from_tensor_files
-    if args.input_counts:
-        if args.tensor and args.tensor_dims:
-            counts = load_counts_from_tensor_files(args.tensor, args.tensor_dims)
-            # counts: Dict[CellKey,int] -> DataFrame
-            inp = pd.DataFrame([
-                {"settlement": k.settlement, "teaor": k.teaor, "bin": k.bin_name, "count": int(v)}
-                for k, v in counts.items()
-            ])
-        else:
-            inp = read_table(pd, args.input_counts)
-            # ... maradhat a meglévő rename_map / normalize_bin logika
+
+    inp = None
+
+    if args.tensor and args.tensor_dims:
+        counts = load_counts_from_tensor_files(args.tensor, args.tensor_dims)
+        inp = pd.DataFrame([
+            {"settlement": k.settlement, "teaor": k.teaor, "bin": k.bin_name, "count": int(v)}
+            for k, v in counts.items()
+        ])
+        print(f"Loaded tensor counts: {len(inp):,} rows")
+
+    elif args.input_counts:
+        inp = read_table(pd, args.input_counts)
+
         # ---- rename Hungarian columns -> expected names ----
         rename_map = {
             "Terület": "settlement",
@@ -142,44 +157,42 @@ def main() -> None:
         }
         inp = inp.rename(columns=rename_map)
 
+    if inp is not None:
         # Required columns check
         required = ["settlement", "teaor", "bin", "count"]
         missing = [c for c in required if c not in inp.columns]
         if missing:
             raise RuntimeError(
-                f"input-counts is missing required columns after rename: {missing}. "
+                f"input counts missing required columns: {missing}. "
                 f"Available columns: {list(inp.columns)}"
             )
 
         inp["settlement"] = inp["settlement"].astype(str)
+        inp["settlement"] = inp["settlement"].str.replace(r"\.0$", "", regex=True).str.strip()
         inp["teaor"] = inp["teaor"].astype(str)
-        # Fix Excel float teaor codes like "1.0" -> "1"
         inp["teaor"] = inp["teaor"].str.replace(r"\.0$", "", regex=True).str.lstrip("0")
         inp.loc[inp["teaor"] == "", "teaor"] = "0"
         inp["count"] = inp["count"].astype(int)
 
-        # ---- normalize bins robustly ----
+        # tensorból jövő bin már jó szokott lenni, CSV/Excel esetén normalize kell
         inp["bin"] = inp["bin"].apply(normalize_bin)
 
-        # Drop rows where bin could not be parsed (these are layout / empty rows)
         before = len(inp)
         inp = inp[~inp["bin"].isna()].copy()
         after = len(inp)
         print(f"Dropped layout/invalid bin rows: {before - after}")
 
-        # Drop rows where we still couldn't parse a bin (these are not comparable cells)
-        bad = inp[inp["bin"].isna()].copy()
-        if len(bad) > 0:
-            bad_path = os.path.join(args.outdir, "input_rows_with_missing_bin.csv")
-            bad.to_csv(bad_path, index=False)
-            print(f"WARNING: {len(bad)} input rows had missing/unparsed bin. Wrote: {bad_path}")
-            inp = inp[~inp["bin"].isna()].copy()
-
-        # Only keep valid bins
         inp = inp[inp["bin"].isin(VALID_BINS)].copy()
+
         print("Input bin value counts:")
         print(inp["bin"].value_counts().to_string())
 
+        print(f"Unique generated cells: {gen[['settlement', 'teaor', 'bin']].drop_duplicates().shape[0]:,}")
+        print("Generated sample:")
+        print(gen[["settlement", "teaor", "bin"]].head(5).to_string(index=False))
+
+        print("Input sample:")
+        print(inp[["settlement", "teaor", "bin"]].head(5).to_string(index=False))
         # generated company counts per cell
         gen_cell = gen.groupby(["settlement", "teaor", "bin"]).size().reset_index(name="generated_count")
 
@@ -187,7 +200,6 @@ def main() -> None:
         comp2["generated_count"] = comp2["generated_count"].astype(int)
         comp2["diff"] = comp2["generated_count"] - comp2["count"]
 
-        # mismatches
         mism = comp2[comp2["diff"] != 0].copy()
         mism = mism.sort_values(["settlement", "teaor", "bin"])
 
@@ -198,18 +210,14 @@ def main() -> None:
 
         print(f"Wrote: {out_all}")
         print(f"Wrote: {out_mis}")
-        print(f"Mismatching cells: {len(mism)} (should be 0 if generation preserves counts)")
+        print(f"Mismatching cells: {len(mism)}")
 
         # -----------------------------
-        # (2b) TEÁOR-bin national compare (stitch bins together by TEÁOR)
-        # This is what the supervisor asked for: distribution shape by TEÁOR.
+        # (2b) TEÁOR-bin national compare
         # -----------------------------
-
-        # KSH: sum counts over settlements -> (teaor, bin)
         ksh_tb = inp.groupby(["teaor", "bin"])["count"].sum().reset_index()
         ksh_tb = ksh_tb.rename(columns={"count": "ksh_count"})
 
-        # Generated: count companies over settlements -> (teaor, bin)
         gen_tb = gen.groupby(["teaor", "bin"]).size().reset_index(name="generated_count")
 
         teaor_bin = ksh_tb.merge(gen_tb, on=["teaor", "bin"], how="outer").fillna(0)
@@ -217,16 +225,13 @@ def main() -> None:
         teaor_bin["generated_count"] = teaor_bin["generated_count"].astype(int)
         teaor_bin["diff"] = teaor_bin["generated_count"] - teaor_bin["ksh_count"]
 
-        # Ratios within TEÁOR (shape comparison)
         teaor_tot_ksh = teaor_bin.groupby("teaor")["ksh_count"].transform("sum")
         teaor_tot_gen = teaor_bin.groupby("teaor")["generated_count"].transform("sum")
 
-        # Avoid div by zero
         teaor_bin["ksh_ratio"] = teaor_bin["ksh_count"] / teaor_tot_ksh.replace(0, float("nan"))
         teaor_bin["generated_ratio"] = teaor_bin["generated_count"] / teaor_tot_gen.replace(0, float("nan"))
         teaor_bin["ratio_diff"] = teaor_bin["generated_ratio"] - teaor_bin["ksh_ratio"]
 
-        # Pretty ordering of bins
         teaor_bin["bin"] = pd.Categorical(teaor_bin["bin"], categories=BIN_ORDER, ordered=True)
         teaor_bin = teaor_bin.sort_values(["teaor", "bin"])
 
@@ -234,26 +239,38 @@ def main() -> None:
         teaor_bin.to_csv(out_tb, index=False)
         print(f"Wrote: {out_tb}")
 
-        # Also write a "wide" pivot (easy Excel chart)
         wide_counts = teaor_bin.pivot_table(index="teaor", columns="bin", values="generated_count", fill_value=0)
         wide_counts_path = os.path.join(args.outdir, "teaor_bin_generated_wide.csv")
         wide_counts.to_csv(wide_counts_path)
         print(f"Wrote: {wide_counts_path}")
 
-        wide_ratios = teaor_bin.pivot_table(index="teaor", columns="bin", values="generated_ratio", fill_value=0)
-        wide_ratios_path = os.path.join(args.outdir, "teaor_bin_generated_ratio_wide.csv")
-        wide_ratios.to_csv(wide_ratios_path)
-        print(f"Wrote: {wide_ratios_path}")
+        wide_ratio = teaor_bin.pivot_table(index="teaor", columns="bin", values="generated_ratio", fill_value=0)
+        wide_ratio_path = os.path.join(args.outdir, "teaor_bin_generated_ratio_wide.csv")
+        wide_ratio.to_csv(wide_ratio_path)
+        print(f"Wrote: {wide_ratio_path}")
 
-        # also compare settlement totals
-        inp_sett = inp.groupby("settlement")["count"].sum().reset_index(name="ksh_companies")
-        gen_sett = gen.groupby("settlement").size().reset_index(name="generated_companies")
-        sett_comp = inp_sett.merge(gen_sett, on="settlement", how="left").fillna({"generated_companies": 0})
-        sett_comp["diff"] = sett_comp["generated_companies"].astype(int) - sett_comp["ksh_companies"].astype(int)
+        settlement_compare = (
+            inp.groupby("settlement")["count"].sum().reset_index(name="input_count")
+            .merge(
+                gen.groupby("settlement").size().reset_index(name="generated_count"),
+                on="settlement",
+                how="outer"
+            )
+            .fillna(0)
+        )
+        settlement_compare["input_count"] = settlement_compare["input_count"].astype(int)
+        settlement_compare["generated_count"] = settlement_compare["generated_count"].astype(int)
+        settlement_compare["diff"] = settlement_compare["generated_count"] - settlement_compare["input_count"]
+        settlement_compare["rel_diff"] = (
+                settlement_compare["diff"] / settlement_compare["input_count"].replace(0, float("nan"))
+        )
 
-        out_sett = os.path.join(args.outdir, "settlement_company_totals_compare.csv")
-        sett_comp.to_csv(out_sett, index=False)
-        print(f"Wrote: {out_sett}")
+        settlement_compare["ratio"] = (
+                settlement_compare["generated_count"] / settlement_compare["input_count"].replace(0, float("nan"))
+        )
+        settlement_path = os.path.join(args.outdir, "settlement_company_totals_compare.csv")
+        settlement_compare.to_csv(settlement_path, index=False)
+        print(f"Wrote: {settlement_path}")
 
 if __name__ == "__main__":
     main()

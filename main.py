@@ -22,7 +22,9 @@ from generator import CellKey, generate_companies_from_counts
 # =========================
 TENSOR_PATH = "tensor_main.npy"
 DIMS_PATH = "tensor_main_dimensions.json"
-
+TARGET_WORKERS = 4_600_000
+BASE_WORKERS = 3_700_000
+ENABLE_COUNT_SCALING = True
 OUTPUT_CSV = "generated_companies.csv"
 TEAOR_PROFILE_XLSX = "teaor_bin_summary.xlsx"
 TEAOR_PROFILE_SHEET = None
@@ -66,6 +68,38 @@ def flatten_generated(
 
     return rows
 
+import math
+
+def scale_counts_proportionally(
+    counts: Dict[CellKey, int],
+    scale: float,
+) -> Dict[CellKey, int]:
+    if scale <= 0:
+        raise ValueError("scale must be > 0")
+
+    items = list(counts.items())
+
+    scaled_floor = {}
+    remainders = []
+
+    for key, value in items:
+        expected = value * scale
+        base = int(math.floor(expected))
+        scaled_floor[key] = base
+        remainders.append((key, expected - base))
+
+    target_total = int(round(sum(counts.values()) * scale))
+    current_total = sum(scaled_floor.values())
+    missing = target_total - current_total
+
+    # legnagyobb tört részek kapnak +1-et
+    remainders.sort(key=lambda x: x[1], reverse=True)
+
+    for i in range(missing):
+        key = remainders[i][0]
+        scaled_floor[key] += 1
+
+    return scaled_floor
 
 def write_csv(rows: List[dict], out_path: str) -> None:
     if not rows:
@@ -85,6 +119,16 @@ def main() -> None:
         dimensions_json_path=DIMS_PATH,
         drop_zeros=True,
     )
+
+    if ENABLE_COUNT_SCALING:
+        scale = TARGET_WORKERS / BASE_WORKERS
+        original_total = sum(counts.values())
+        counts = scale_counts_proportionally(counts, scale)
+        scaled_total = sum(counts.values())
+
+        print(f"Scaling enabled: factor = {scale:.6f}")
+        print(f"Original organization count total: {original_total:,}")
+        print(f"Scaled organization count total:   {scaled_total:,}")
 
     teaor_bin_probs = load_teaor_bin_profiles(
         TEAOR_PROFILE_XLSX,
@@ -118,14 +162,13 @@ def main() -> None:
     BIN_ORDER = ["1-4","5-9","10-19","20-49","50-249","250-1000"]
 
     profile_by_teaor_bin = {}
+    window_by_boundary = {}
 
     for tea, bp in teaor_bin_probs.items():
-        # default per-bin: inherit from teaor-level profile
         base = profile_by_teaor.get(tea, DEFAULT_PROFILE)
         for b in BIN_ORDER:
             profile_by_teaor_bin[(tea, b)] = base
 
-        # edge rules: adjust only bins around boundaries
         for i in range(len(BIN_ORDER) - 1):
             b_lo = BIN_ORDER[i]
             b_hi = BIN_ORDER[i + 1]
@@ -133,25 +176,25 @@ def main() -> None:
             p_lo = bp.get(b_lo, 0.0)
             p_hi = bp.get(b_hi, 0.0)
 
-            # if upper bin basically absent => don't force boundary smoothing here
             if p_hi < SUPPORT_MIN or p_lo <= 0:
                 continue
 
-            r = p_hi / p_lo  # how big the upper bin is relative to lower
+            r = p_hi / p_lo
 
-            # If upper is tiny relative to lower, we want:
-            # - lower bin NOT to pile up at its upper edge -> stronger decay
-            # - upper bin to pile up at its lower edge -> stronger exp
             if r < R_ULTRA:
                 profile_by_teaor_bin[(tea, b_lo)] = "decay_ultra"
                 profile_by_teaor_bin[(tea, b_hi)] = "exp_ultra"
+                window_by_boundary[(tea, b_lo, b_hi)] = 1
+
             elif r < R_STRONG:
                 profile_by_teaor_bin[(tea, b_lo)] = "decay_strong"
                 profile_by_teaor_bin[(tea, b_hi)] = "exp_strong"
+                window_by_boundary[(tea, b_lo, b_hi)] = 1
+
             else:
-                # mild boundary handling
                 profile_by_teaor_bin[(tea, b_lo)] = "decay_mild"
                 profile_by_teaor_bin[(tea, b_hi)] = "exp_mild"
+                window_by_boundary[(tea, b_lo, b_hi)] = 2
 
     # Filter to whitelist TEÁORs (pilot)
     if TEAOR_WHITELIST:
@@ -173,6 +216,7 @@ def main() -> None:
         profile_by_teaor_bin=profile_by_teaor_bin,
         default_profile=DEFAULT_PROFILE,
         seed=SEED,
+        window_by_boundary=window_by_boundary,
     )
 
     # quick sanity

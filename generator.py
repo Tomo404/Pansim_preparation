@@ -195,7 +195,7 @@ def _smooth_one_boundary(
         delta_p = delta_c / prev_total
         delta_p = min(delta_p, prev_probs[-1] * 0.95)  # ne nullázzuk ki teljesen
         # ne vágjuk a prev edge-et a base-hez képest túl mélyre
-        min_edge = 0.40 * prev_base[-1]  # CHANGEABLE
+        min_edge = 0.30 * prev_base[-1]  # CHANGEABLE
         max_delta_allowed = max(0.0, prev_probs[-1] - min_edge)
         delta_p = min(delta_p, max_delta_allowed)
         hi = len(prev_probs) - 1
@@ -239,11 +239,12 @@ class CellKey:
 
 def generate_companies_from_counts(
     counts: Dict[CellKey, int],
-    boundary_ratio_threshold: float = 0.35, # CHANGEABLE
+    boundary_ratio_threshold: float = 0.33, # CHANGEABLE
     profile_by_teaor: Optional[Dict[str, str]] = None,
     profile_by_teaor_bin: Optional[Dict[tuple, str]] = None,
     default_profile: str = "decay_mild",
     seed: int = 12345,
+    window_by_boundary: Optional[Dict[tuple, int]] = None,
 ) -> Dict[CellKey, List[int]]:
     """
     Main batch generator.
@@ -281,8 +282,12 @@ def generate_companies_from_counts(
         probs_map: Dict[str, List[float]] = {bn: base_map[bn][:] for bn in BINS.keys()}  # másolat
 
         # határ-simítás: pár iteráció, hogy stabilabb legyen
-        for _ in range(6): # CHANGEABLE
+        for _ in range(4):  # CHANGEABLE
             for b_prev, b_next in BOUNDARIES:
+                current_window = 2
+                if window_by_boundary is not None:
+                    current_window = window_by_boundary.get((teaor, b_prev, b_next), 2)
+
                 _smooth_one_boundary(
                     prev_probs=probs_map[b_prev],
                     next_probs=probs_map[b_next],
@@ -291,7 +296,7 @@ def generate_companies_from_counts(
                     threshold=boundary_ratio_threshold,
                     prev_base=base_map[b_prev],
                     next_base=base_map[b_next],
-                    window=2,  # CHANGEABLE
+                    window=current_window,
                 )
 
         teaor_bin_probs[teaor] = probs_map
